@@ -3,7 +3,9 @@
 **rise** is an AI-agent entry for the **Proof Gatekeeper** track of
 [zkVerify Agent Games, Season 01](https://agentgames.zkverify.io) (21 Oct –
 21 Nov 2026). It is a small, zero-dependency Node.js service that answers
-incoming gatekeeper tasks with an `APPROVE` / `REJECT` decision.
+incoming gatekeeper tasks with an `APPROVE` / `REJECT` decision, following
+the real agent interface from the Games' Playbook (§02 "Agent Interface —
+Receive, decide, respond").
 
 ## The game
 
@@ -13,101 +15,184 @@ decision boundary is strict:
 
 > **APPROVE only when every field agrees. Anything else is a REJECT.**
 
-The arena's own preview lists these outcomes:
-
 | Reason | Meaning |
 |---|---|
 | `VALID_CONDITION` | Everything agrees → **APPROVE** |
-| `VK_SUBSTITUTION` | The proof verification key differs from the committed one → **REJECT** |
-| `RECIPIENT_MISMATCH` | The recipient differs from the committed one → **REJECT** |
-| `THRESHOLD_MISMATCH` | The amount is above the committed maximum (or missing/invalid) → **REJECT** |
+| `VK_SUBSTITUTION` | `proof_vk` differs from `registered_vk` → **REJECT** |
+| `RECIPIENT_MISMATCH` | `recipient` differs from `condition_recipient` → **REJECT** |
+| `THRESHOLD_MISMATCH` | A threshold check fails (amount / balance / expiry / deadline) → **REJECT** |
 
-`rise` implements exactly that boundary, and it **fails closed**: if any
-reference value is missing, the task is rejected rather than approved on
-incomplete data.
+`rise` implements exactly that boundary, and it **fails closed**: missing
+reference values, a stale deadline, any error, or any uncertainty is a
+REJECT — never an approve by default.
 
 ## API
 
 ### `GET /health`
 
-Health check for the arena.
+Health check for the arena (unsigned liveness check).
 
 ```json
 { "status": "ok", "agent": "rise" }
 ```
 
-### `POST /agent`
+### `POST /agent` — authenticated
 
-Submit one task, get one decision. Extra fields are tolerated and ignored.
-A task `id` / `taskId` is echoed back as `taskId` when present.
+Every request must carry a valid `x-agent-games-signature` header: HMAC-SHA256
+over the **raw request body**, keyed with the agent secret (see
+[Secret](#secret) below). The signature is verified against the raw body
+**before** any parsing. A bad or missing signature gets HTTP 401 and no
+decision. Every response is signed the same way (HMAC over the raw response
+body, same header, same secret).
 
-Request:
+#### Incoming task envelope — Proof Gatekeeper
 
 ```json
 {
-  "id": "gk_901",
-  "recipient": "0xD0620000000000000000000000000000009F81",
-  "expectedRecipient": "0xD0620000000000000000000000000000009F81",
-  "amount": 1000,
-  "maximum": 1000,
-  "proofVk": "vk-abc-123",
-  "expectedVk": "vk-abc-123"
+  "type": "agent-games.proof-gatekeeper.v1",
+  "task_id": "gk_8d31...",
+  "mode": "competition",
+  "issued_at": "<issued-at>",
+  "deadline_at": "<deadline>",
+  "input": {
+    "registered_vk": "0x7d...01",
+    "proof_vk": "0x13...aa",
+    "minimum": "1000",
+    "public_balance": "1460",
+    "expiry_block": 8430000,
+    "current_block": 8420000,
+    "recipient": "0xDe62..9F81",
+    "condition_recipient": "0xDe62..9F81",
+    "amount": "500",
+    "max_transfer": "1000",
+    "proof_tx": "0xa8...2c"
+  }
 }
 ```
 
-Response:
-
-```json
-{ "decision": "APPROVE", "reason": "VALID_CONDITION", "agent": "rise", "taskId": "gk_901" }
-```
-
-Accepted field aliases (same meaning):
-
-- amount: `amount`, `publicBalance`, `value`, `public_balance`
-- maximum: `maximum`, `threshold`, `max`, `limit`
-- proof VK: `proofVk`, `vk`, `proof_vk`
-- expected VK: `expectedVk`, `expectedProofVk`, `committedVk`, `expected_vk`
-- recipient: `recipient`, `to`, `payee`
-- expected recipient: `expectedRecipient`, `committedRecipient`, `expected_recipient`
-
 Checks, in order:
 
-1. **Proof VK** — must match the expected VK exactly. Missing either side → `VK_SUBSTITUTION`.
-2. **Recipient** — must match the expected recipient (case-insensitive, for hex addresses). Missing either side → `RECIPIENT_MISMATCH`.
-3. **Threshold** — amount must be a non-negative number and `amount <= maximum`. Missing, non-numeric, negative, or above the cap → `THRESHOLD_MISMATCH`. Integer values are compared with `BigInt`, so large on-chain values do not lose precision.
+1. **Proof VK** — `proof_vk` must match `registered_vk` exactly (hex,
+   case-insensitive). Missing either side → `VK_SUBSTITUTION`.
+2. **Recipient** — `recipient` must match `condition_recipient`
+   (case-insensitive). Missing either side → `RECIPIENT_MISMATCH`.
+3. **Thresholds** — all must hold, otherwise `THRESHOLD_MISMATCH`:
+   - `amount` is a non-negative number and `amount <= max_transfer`;
+   - `public_balance >= minimum`;
+   - `current_block <= expiry_block`.
+   Integer values are compared with `BigInt`, so large on-chain values do
+   not lose precision. A missing or non-numeric reference fails closed.
+4. **Deadline** — when `deadline_at` is present and parseable (ISO 8601 or
+   epoch seconds/milliseconds), a task past its deadline is stale →
+   `THRESHOLD_MISMATCH`. This is the Playbook's 60s hard deadline; the HTTP
+   server additionally closes requests still open after 60s.
 
-A malformed (non-JSON, non-object) body gets HTTP 400; unknown paths get 404.
+#### Required response (200, `application/json`)
+
+```json
+{ "decision": "REJECT", "reason_code": "VK_SUBSTITUTION", "proof_tx": "0xa8...2c" }
+```
+
+`proof_tx` is echoed from the task's `input.proof_tx` when present. When a
+real proof exists, `proof` and `public_signals` are included too (see
+[Proofs](#proofs)); until then they are omitted.
+
+#### Preflight — runs before any task
+
+After registration and rotating the secret, the platform sends a signed
+preflight request to verify the endpoint can authenticate and sign
+responses. It is dispatched on `type`, never treated as a task:
+
+```json
+{ "type": "agent-games.preflight.v1", "agent_id": "ag1_...", "issued_at": "<issued-at>", "nonce": "abc123" }
+```
+
+Response (signed):
+
+```json
+{ "ok": true, "protocolVersion": "v1" }
+```
+
+Preflight must pass before the platform marks the agent active.
+
+#### Errors
+
+| Status | Meaning |
+|---|---|
+| 401 | Missing/invalid signature, or no secret configured on the server |
+| 400 | Malformed JSON, non-object body, or unknown message `type` |
+| 404 | Unknown path |
+
+## Secret
+
+The HMAC secret is generated by the platform and revealed **once** via
+"Rotate Secret" on the dashboard. The operator copies the plaintext and sets
+it as `AGENT_GAMES_HMAC_SECRET` in the environment. It is never hardcoded,
+never committed, and never logged. Without it, `POST /agent` refuses
+everything (fail closed). `.env` is git-ignored; copy `.env.example` to
+`.env` and fill it in.
+
+## Proofs
+
+The Playbook scaffold calls for local Groth16 proof generation with snarkjs
+(using the downloaded wasm/zkey) and zkVerify submission (Kurier REST or
+zkVerifyJS), waiting for a finalized result before treating a proof as
+confirmed. That flow is implemented as a clearly-separated module,
+[`proof.js`](proof.js) — `generateProof()` → `submitProof()` → wait for
+finalization — but it is **scaffolded, not live**: the wasm/zkey circuit
+artifacts come from the Playbook downloads and are not in this repo, and no
+Kurier/zkVerifyJS credential is configured. The module returns a clear
+"not configured" result instead of inventing a proof, and the decision path
+works fully without one (the `proof` / `public_signals` response fields are
+omitted until a real proof exists).
+
+To go live:
+
+1. Download the Playbook's wasm/zkey for the gatekeeper circuit and set
+   `ZK_WASM_PATH` / `ZK_ZKEY_PATH`.
+2. Install snarkjs (`npm install snarkjs`) — an optional dependency, loaded
+   lazily only when configured.
+3. Set either `ZK_KURIER_URL` + `ZK_KURIER_API_KEY` (Kurier REST) or
+   `ZK_SEED_PHRASE` (zkVerifyJS path — never commit it).
+4. Set `PROOF_ENABLED=1` so the server attempts proof generation (guarded by
+   a 10s timeout; a failure or timeout simply omits the proof fields and
+   never changes the decision).
 
 ## Run locally
 
 Requires Node.js 18+ and nothing else — no dependencies to install.
 
 ```bash
-node server.js            # listens on :3000 (or $PORT)
+cp .env.example .env   # set AGENT_GAMES_HMAC_SECRET to a test value
+node server.js         # listens on :3000 (or $PORT)
 ```
 
-Try it:
+Try it (sign requests with the same secret):
 
 ```bash
 curl -s localhost:3000/health
-curl -s -X POST localhost:3000/agent -H 'content-type: application/json' -d '{
-  "recipient": "0xD0620000000000000000000000000000009F81",
-  "expectedRecipient": "0xD0620000000000000000000000000000009F81",
-  "amount": 1000, "maximum": 1000,
-  "proofVk": "vk-abc-123", "expectedVk": "vk-abc-123"
-}'
+
+BODY='{"type":"agent-games.proof-gatekeeper.v1","task_id":"gk_901","deadline_at":"2999-01-01T00:00:00Z","input":{"registered_vk":"0x7d01","proof_vk":"0x7d01","minimum":"1000","public_balance":"1460","expiry_block":8430000,"current_block":8420000,"recipient":"0xDe629F81","condition_recipient":"0xde629f81","amount":"500","max_transfer":"1000","proof_tx":"0xa82c"}}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$AGENT_GAMES_HMAC_SECRET" | cut -d' ' -f2)
+curl -s -X POST localhost:3000/agent -H 'content-type: application/json' -H "x-agent-games-signature: $SIG" -d "$BODY"
 ```
 
 ## Tests
 
 ```bash
-npm test        # node --test test.js
+npm test        # node --test test.js — 28 tests, 0 fail
 ```
 
-The suite covers the pure decision logic (approve on a fully valid task,
-reject on each of the three mismatch kinds, fail-closed on missing reference
-values, boundary and alias cases) plus a live HTTP smoke test of `/health`
-and `/agent`.
+The suite covers the pure decision logic on the real nested schema (approve
+on a fully valid task, reject on each mismatch kind, balance/expiry/deadline
+failures, fail-closed on missing references, boundary and BigInt cases), the
+HMAC helpers (round-trip, wrong secret, tampered body, `sha256=` prefix),
+the proof module's not-configured behaviour, and live HTTP tests of the
+spawned server: signed task → signed `APPROVE`, signed tampered task →
+signed `REJECT`, signed preflight → signed `{ok:true, protocolVersion:"v1"}`,
+missing/bad HMAC → 401 with no decision, malformed JSON (valid signature) →
+400, unknown type → 400, stale task → `REJECT`, and a server with no secret
+refusing every POST.
 
 ## Deploy as a service
 
@@ -117,24 +202,43 @@ The Agent Games registration form takes an optional agent endpoint, e.g.
 
 ```bash
 fly launch --no-deploy   # answer the prompts, pick a region
+fly secrets set AGENT_GAMES_HMAC_SECRET='<paste the dashboard secret>'
 fly deploy
 fly open                 # check https://<app>.fly.dev/health
 ```
 
 Then register the endpoint URL (`https://<app>.fly.dev/agent`) in the
 Agent Games dashboard. Any other Node host works the same way — the service
-only needs `node server.js` and a public URL.
+only needs `node server.js`, the `AGENT_GAMES_HMAC_SECRET` env var, and a
+public URL.
 
-## Honest note on the task schema
+## Assumptions
 
-The exact JSON schema the arena sends to an agent endpoint is **not
-published** (no public docs were found for it at the time this repo was
-written). The field names above are taken from the arena's own preview
-screen (maximum, public balance, proof VK, recipient) and the reason codes
-from its recent-decisions list, plus common aliases. If the real arena
-payload uses different field names, the mapping lives in one place —
-`decide.js` (`pick(...)` calls) — and can be adjusted there without touching
-the server.
+The Playbook documents the envelope, the decision boundary, the preflight,
+and the secret flow, but leaves these details unspecified — each was resolved
+as follows (all documented in code where it matters):
+
+1. **HMAC wire format**: the header carries lowercase hex HMAC-SHA256 of the
+   raw body. A `sha256=<hex>` prefixed value is also accepted on verify.
+   (If the platform uses a different construction — e.g. HMAC over
+   `timestamp + "." + body` — only `hmac.js` needs to change.)
+2. **Response shape**: exactly `{decision, reason_code, proof_tx?}` plus
+   `proof` / `public_signals` when a proof exists. The v1 `reason` /
+   `agent` / `taskId` fields were dropped to match the Playbook.
+3. **`minimum` check**: `public_balance >= minimum` (the minimum required
+   balance), derived from the field names. `amount` is checked against
+   `max_transfer` only.
+4. **Block expiry**: `current_block <= expiry_block` → valid; past it →
+   `THRESHOLD_MISMATCH`.
+5. **Deadline**: `deadline_at` accepts ISO 8601 or epoch seconds /
+   milliseconds. An unparseable `deadline_at` is ignored (metadata, not a
+   decision field); an absent one is not checked.
+6. **Preflight**: dispatched on `type` only; the `nonce` is not replay-checked
+   (no replay store is specified) — authentication rests on the HMAC.
+7. **Proof**: scaffolded only (see [Proofs](#proofs)). No wasm/zkey, no
+   credential, no snarkjs in this repo; nothing is faked.
+8. **Task `mode`** (`competition` / `practice`) is accepted and ignored — the
+   decision logic is identical for both.
 
 ## License
 
