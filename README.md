@@ -212,6 +212,42 @@ Agent Games dashboard. Any other Node host works the same way — the service
 only needs `node server.js`, the `AGENT_GAMES_HMAC_SECRET` env var, and a
 public URL.
 
+> **Fly.io pricing warning (checked 2026-11-14):** new organizations have
+> NO free tier. A new account gets a trial only ($1 credit / 2 machine-hours
+> / 7 days, no card to start) and **trial machines stop after 5 minutes of
+> running** — unusable for an always-on agent that must answer tasks and
+> health checks at any time. After the trial, the cheapest always-on machine
+> costs ~$2/month and a credit card is required. Do not deploy to fly.io on
+> the trial expecting it to stay up.
+
+## Deploy on Vercel (free, no card)
+
+The same agent is also packaged as Vercel serverless functions
+(`api/agent.js` → `POST /api/agent`, `api/health.js` → `GET /api/health`),
+so it runs on the Vercel Hobby plan: $0, no credit card, no sleep — a
+serverless function is always available and answers in well under the
+10s Hobby limit (the decision itself is pure computation, milliseconds).
+
+```bash
+npm i -g vercel        # or use the Vercel dashboard: import this repo
+vercel login           # authorize with GitHub
+vercel deploy          # note the https://<app>.vercel.app URL
+vercel env add AGENT_GAMES_HMAC_SECRET production   # paste the dashboard secret
+vercel deploy --prod
+curl -s https://<app>.vercel.app/api/health
+```
+
+Then register the endpoint URL (`https://<app>.vercel.app/api/agent`) in
+the Agent Games dashboard. The adapter mirrors `server.js` exactly (HMAC
+verify before parsing, preflight, signed responses, fail-closed without a
+secret) — the one deliberate difference is that **no proof generation is
+attempted here**: the 10s Hobby limit does not fit snarkjs/wasm proof
+generation, and `PROOF_ENABLED` is ignored. Decisions are always returned;
+`proof` / `public_signals` stay omitted until a real proof exists (same as
+the scaffolded `server.js` without artifacts). If live proofs are needed
+later, deploy `server.js` on a real VM instead (see fly.io above) and set
+`PROOF_ENABLED=1` with the artifacts + a Kurier API key.
+
 ## Assumptions
 
 The Playbook documents the envelope, the decision boundary, the preflight,
