@@ -2,10 +2,12 @@
 
 **rise** is an AI-agent entry for the **Proof Gatekeeper** track of
 [zkVerify Agent Games, Season 01](https://agentgames.zkverify.io) (21 Oct –
-21 Nov 2026). It is a small, zero-dependency Node.js service that answers
-incoming gatekeeper tasks with an `APPROVE` / `REJECT` decision, following
-the real agent interface from the Games' Playbook (§02 "Agent Interface —
-Receive, decide, respond").
+21 Nov 2026). It is a small Node.js service that answers incoming
+gatekeeper tasks with an `APPROVE` / `REJECT` decision, following the real
+agent interface from the Games' Playbook (§02 "Agent Interface — Receive,
+decide, respond"), and — when configured — generates a real Groth16 proof
+of each decision with snarkjs and submits it to zkVerify via Kurier (see
+[Proofs](#proofs)).
 
 ## The game
 
@@ -134,35 +136,89 @@ everything (fail closed). `.env` is git-ignored; copy `.env.example` to
 
 ## Proofs
 
-The Playbook scaffold calls for local Groth16 proof generation with snarkjs
-(using the downloaded wasm/zkey) and zkVerify submission (Kurier REST or
-zkVerifyJS), waiting for a finalized result before treating a proof as
-confirmed. That flow is implemented as a clearly-separated module,
-[`proof.js`](proof.js) — `generateProof()` → `submitProof()` → wait for
-finalization — but it is **scaffolded, not live**: the wasm/zkey circuit
-artifacts come from the Playbook downloads and are not in this repo, and no
-Kurier/zkVerifyJS credential is configured. The module returns a clear
-"not configured" result instead of inventing a proof, and the decision path
-works fully without one (the `proof` / `public_signals` response fields are
-omitted until a real proof exists).
+The Playbook calls for local Groth16 proof generation with snarkjs (using
+the downloaded wasm/zkey) and zkVerify submission via Kurier REST, waiting
+for a finalized result before treating a proof as confirmed. That flow is
+implemented for real in [`proof.js`](proof.js) —
+`generateProof()` → `submitProof()` → poll to `Finalized` — and the
+circuit artifacts ship in [`circuits/`](circuits/) (see
+[`circuits/README.md`](circuits/README.md) for provenance and hashes).
 
-To go live:
+**Circuit.** Groth16 / BN128, Circom 2.x, template `GatekeeperEvaluation`
+(13 input signals, 13 public signals). Registered verification-key hash on
+zkVerify mainnet (from `https://agentgames.zkverify.io/api/circuit-info`):
 
-1. Download the Playbook's wasm/zkey for the gatekeeper circuit and set
-   `ZK_WASM_PATH` / `ZK_ZKEY_PATH`.
-2. Install snarkjs (`npm install snarkjs`) — an optional dependency, loaded
-   lazily only when configured.
-3. Set either `ZK_KURIER_URL` + `ZK_KURIER_API_KEY` (Kurier REST) or
-   `ZK_SEED_PHRASE` (zkVerifyJS path — never commit it).
-4. Set `PROOF_ENABLED=1` so the server attempts proof generation (guarded by
-   a 10s timeout; a failure or timeout simply omits the proof fields and
-   never changes the decision).
+```
+0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0
+```
+
+**Circuit inputs — discovered empirically, not published on the Playbook.**
+The 13 input signal names were found by probing the downloaded wasm with
+circom_runtime's witness calculator (a name that exists is accepted; any
+other name errors), and the encodings were confirmed by generating proofs
+and verifying them locally against the exported verification key. The
+mapping lives in ONE function, `buildCircuitInputs()` in `proof.js`:
+
+| Signal | Encoding |
+|---|---|
+| `recipient`, `conditionRecipient` | `BigInt(0x-address)` (160-bit fits the field) |
+| `amount`, `maxTransfer`, `minimum`, `publicBalance`, `expiryBlock`, `currentBlock` | `BigInt` as-is |
+| `decision` | `1n` for APPROVE, `0n` for REJECT |
+| `taskId` | `keccak256(utf8(taskId)) mod p` |
+| `registeredVkHash`, `proofVkHash` | `BigInt(0x-hash) mod p` (256-bit hash exceeds the field modulus) |
+| `salt` | `keccak256('agent-games-salt\|' + taskId) mod p` — deterministic per task |
+
+**Public signals (13, in order):**
+
+```
+[ Poseidon(salt, taskId), registeredVkHash, proofVkHash, minimum,
+  publicBalance, expiryBlock, currentBlock, recipient,
+  conditionRecipient, amount, maxTransfer, decision, taskId ]
+```
+
+Public signal 0 — `Poseidon(salt, taskId)` — is the proof reference
+(nullifier) binding the proof to its task; it was identified by varying
+one input at a time and matching the value against Poseidon candidates.
+The circuit enforces decision correctness: a decision inconsistent with
+the checks fails witness generation (assert in the template), so only the
+decision `decide.js` already computed is ever proven — the circuit is the
+referee.
+
+**Kurier flow (Playbook §03, RECOMMENDED; zkVerifyJS is not implemented).**
+
+```js
+POST https://api.kurier.xyz/api/v1/submit-proof/{KURIER_API_KEY}
+{ proofType: 'groth16', vkRegistered: true,
+  proofOptions: { library: 'snarkjs', curve: 'bn128' },
+  proofData: { proof, publicSignals, vk: GATEKEEPER_VK_HASH } }
+
+GET https://api.kurier.xyz/api/v1/job-status/{KURIER_API_KEY}/{jobId}
+// states: Submitted → IncludedInBlock → Finalized (only Finalized counts)
+```
+
+**To go live** (the operator — a Kurier API key needs the operator's
+account, it cannot be created by the agent):
+
+1. Create a Kurier mainnet API key at https://kurier.xyz and set
+   `KURIER_API_KEY` (see `.env.example`). The key goes in the Kurier
+   request path, never in a header, never in logs.
+2. Set `PROOF_ENABLED=1` so the server attempts proof generation. The
+   attempt is capped at 45s (local proving is ~1s; Kurier submit + polling
+   to Finalized takes the rest) — well inside the Playbook's 60s hard
+   deadline. A failure or timeout simply omits the `proof` /
+   `public_signals` fields and never changes the decision.
+
+Without `PROOF_ENABLED=1` or without a Kurier key, the decision path works
+fully on its own and the proof fields stay omitted.
 
 ## Run locally
 
-Requires Node.js 18+ and nothing else — no dependencies to install.
+Requires Node.js 22.3+ (`--test-force-exit` in the test script needs it;
+snarkjs's worker threads otherwise keep the test runner alive after the
+tests finish — see `package.json`).
 
 ```bash
+npm install          # snarkjs + js-sha3 (proofs); circomlibjs is dev-only (tests)
 cp .env.example .env   # set AGENT_GAMES_HMAC_SECRET to a test value
 node server.js         # listens on :3000 (or $PORT)
 ```
@@ -180,18 +236,26 @@ curl -s -X POST localhost:3000/agent -H 'content-type: application/json' -H "x-a
 ## Tests
 
 ```bash
-npm test        # node --test test.js — 28 tests, 0 fail
+npm test        # node --test --test-force-exit test.js — 36 tests, 0 fail
 ```
+
+(`--test-force-exit` is needed because snarkjs's worker threads keep the
+test process alive after the tests finish; it requires Node 22.3+.)
 
 The suite covers the pure decision logic on the real nested schema (approve
 on a fully valid task, reject on each mismatch kind, balance/expiry/deadline
 failures, fail-closed on missing references, boundary and BigInt cases), the
 HMAC helpers (round-trip, wrong secret, tampered body, `sha256=` prefix),
-the proof module's not-configured behaviour, and live HTTP tests of the
-spawned server: signed task → signed `APPROVE`, signed tampered task →
-signed `REJECT`, signed preflight → signed `{ok:true, protocolVersion:"v1"}`,
-missing/bad HMAC → 401 with no decision, malformed JSON (valid signature) →
-400, unknown type → 400, stale task → `REJECT`, and a server with no secret
+the proof module — real local proof generation (approve-case and
+reject-case proofs verify against the exported verification key, public
+signals match the documented layout including `Poseidon(salt, taskId)` as
+signal 0, an inconsistent decision fails proof generation) and Kurier
+submission against a stubbed fetch (Finalized flow, missing key, failed
+submit, no network in tests) — and live HTTP tests of the spawned server:
+signed task → signed `APPROVE`, signed tampered task → signed `REJECT`,
+signed preflight → signed `{ok:true, protocolVersion:"v1"}`, missing/bad
+HMAC → 401 with no decision, malformed JSON (valid signature) → 400,
+unknown type → 400, stale task → `REJECT`, and a server with no secret
 refusing every POST.
 
 ## Deploy as a service
@@ -242,11 +306,11 @@ the Agent Games dashboard. The adapter mirrors `server.js` exactly (HMAC
 verify before parsing, preflight, signed responses, fail-closed without a
 secret) — the one deliberate difference is that **no proof generation is
 attempted here**: the 10s Hobby limit does not fit snarkjs/wasm proof
-generation, and `PROOF_ENABLED` is ignored. Decisions are always returned;
-`proof` / `public_signals` stay omitted until a real proof exists (same as
-the scaffolded `server.js` without artifacts). If live proofs are needed
-later, deploy `server.js` on a real VM instead (see fly.io above) and set
-`PROOF_ENABLED=1` with the artifacts + a Kurier API key.
+generation plus Kurier polling to Finalized (the server path budgets 45s),
+and `PROOF_ENABLED` is ignored. Decisions are always returned;
+`proof` / `public_signals` stay omitted on the serverless path. If live
+proofs are needed, deploy `server.js` on a real host instead (see fly.io
+above) and set `PROOF_ENABLED=1` with a Kurier API key.
 
 ## Assumptions
 
@@ -271,8 +335,18 @@ as follows (all documented in code where it matters):
    decision field); an absent one is not checked.
 6. **Preflight**: dispatched on `type` only; the `nonce` is not replay-checked
    (no replay store is specified) — authentication rests on the HMAC.
-7. **Proof**: scaffolded only (see [Proofs](#proofs)). No wasm/zkey, no
-   credential, no snarkjs in this repo; nothing is faked.
+7. **Proof encodings**: the Playbook does not publish the circuit's input
+   signal names or their encodings. The names were discovered by probing
+   the downloaded wasm, and the encodings (keccak256-mod-p for `taskId`
+   and the VK hashes; deterministic per-task salt) were confirmed by
+   generating proofs and verifying them locally against the exported
+   verification key (see [Proofs](#proofs)). The vk_hash used for Kurier
+   is the live value from `/api/circuit-info` (screenshot transcriptions
+   of the hash were truncated by OCR and are not authoritative); its
+   construction from the verification key was not reproduced, so the
+   published constant is used as-is. The salt is deterministic per taskId
+   rather than random — the platform only ever sees `Poseidon(salt,
+   taskId)`, which is unique per task.
 8. **Task `mode`** (`competition` / `practice`) is accepted and ignored — the
    decision logic is identical for both.
 

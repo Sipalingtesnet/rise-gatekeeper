@@ -195,19 +195,212 @@ test('hmac: verify rejects a tampered body', () => {
   assert.equal(verify(TEST_SECRET, Buffer.from('{"a":2}', 'utf8'), sig), false);
 });
 
-// --- proof module: scaffolded, not configured --------------------------------
+// --- proof module: real implementation --------------------------------------
+// The circuit artifacts ship in circuits/, so hasArtifacts is true; the
+// module is "configured" only once a Kurier API key is also set (the key
+// needs the operator's kurier.xyz account). These tests run with the key
+// unset unless a test sets it explicitly (saved + restored).
 
-test('proof: unconfigured without artifacts/credentials', () => {
-  const status = proof.getProofStatus();
-  assert.equal(status.configured, false);
-  assert.equal(status.hasArtifacts, false);
+async function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) {
+    saved[k] = process.env[k];
+    if (vars[k] === undefined) delete process.env[k];
+    else process.env[k] = vars[k];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const k of Object.keys(vars)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+/** Decision inputs for a real proof, from the valid envelope + a decision. */
+function proofInputsForTest(envelope, decision) {
+  const input = envelope.input;
+  return {
+    taskId: envelope.task_id,
+    registeredVk: input.registered_vk,
+    proofVk: input.proof_vk,
+    recipient: input.recipient,
+    conditionRecipient: input.condition_recipient,
+    amount: input.amount,
+    maxTransfer: input.max_transfer,
+    minimum: input.minimum,
+    publicBalance: input.public_balance,
+    expiryBlock: input.expiry_block,
+    currentBlock: input.current_block,
+    decision,
+  };
+}
+
+test('proof: status without a Kurier key is not configured (artifacts present, key missing)', async () => {
+  await withEnv({ KURIER_API_KEY: undefined }, () => {
+    const status = proof.getProofStatus();
+    assert.equal(status.configured, false);
+    assert.equal(status.hasArtifacts, true);
+    assert.equal(status.snarkjsAvailable, true);
+    assert.equal(status.kurierConfigured, false);
+    assert.equal(status.vkHash, proof.GATEKEEPER_VK_HASH);
+  });
 });
 
-test('proof: proveDecision without configuration returns ok:false, no fake proof', async () => {
-  const r = await proof.proveDecision({ decision: 'APPROVE' });
+test('proof: proveDecision without a Kurier key returns ok:false, no fake proof', async () => {
+  await withEnv({ KURIER_API_KEY: undefined }, async () => {
+    const r = await proof.proveDecision(proofInputsForTest(validEnvelope(), 'APPROVE'));
+    assert.equal(r.ok, false);
+    assert.equal(r.proof, undefined);
+    assert.match(r.reason, /KURIER_API_KEY/);
+  });
+});
+
+test('proof: generateProof produces a real locally-verifying proof (APPROVE case)', async () => {
+  const snarkjs = require('snarkjs');
+  const { buildPoseidon } = require('circomlibjs');
+  const inputs = proofInputsForTest(validEnvelope(), 'APPROVE');
+  const r = await proof.generateProof(inputs);
+  assert.equal(r.ok, true);
+  assert.equal(typeof r.proof, 'object');
+  assert.ok(r.proof.pi_a && r.proof.pi_b && r.proof.pi_c, 'groth16 proof shape');
+  assert.equal(r.publicSignals.length, 13);
+  // Public signals follow the documented layout: [Poseidon(salt, taskId),
+  // registeredVkHash, proofVkHash, minimum, publicBalance, expiryBlock,
+  // currentBlock, recipient, conditionRecipient, amount, maxTransfer,
+  // decision, taskId].
+  const circuitInputs = proof.buildCircuitInputs(inputs);
+  assert.equal(r.publicSignals[1], circuitInputs.registeredVkHash.toString());
+  assert.equal(r.publicSignals[2], circuitInputs.proofVkHash.toString());
+  assert.equal(r.publicSignals[3], '1000'); // minimum
+  assert.equal(r.publicSignals[4], '1460'); // publicBalance
+  assert.equal(r.publicSignals[11], '1'); // decision APPROVE
+  assert.equal(r.publicSignals[12], circuitInputs.taskId.toString());
+  const poseidon = await buildPoseidon();
+  assert.equal(
+    poseidon.F.toString(poseidon([circuitInputs.salt, circuitInputs.taskId])),
+    r.publicSignals[0],
+    'public signal 0 is Poseidon(salt, taskId)',
+  );
+  const vk = await snarkjs.zKey.exportVerificationKey(
+    path.join(__dirname, 'circuits', 'gatekeeper_final.zkey'),
+  );
+  assert.equal(await snarkjs.groth16.verify(vk, r.publicSignals, r.proof), true);
+});
+
+test('proof: generateProof for a REJECT decision on a mismatched task verifies too', async () => {
+  const snarkjs = require('snarkjs');
+  const t = validEnvelope();
+  t.input.recipient = '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const r = await proof.generateProof(proofInputsForTest(t, 'REJECT'));
+  assert.equal(r.ok, true);
+  assert.equal(r.publicSignals[11], '0'); // decision REJECT
+  const vk = await snarkjs.zKey.exportVerificationKey(
+    path.join(__dirname, 'circuits', 'gatekeeper_final.zkey'),
+  );
+  assert.equal(await snarkjs.groth16.verify(vk, r.publicSignals, r.proof), true);
+});
+
+test('proof: generateProof with a decision inconsistent with the checks fails (circuit asserts)', async () => {
+  // Fully valid task but decision REJECT: the circuit enforces decision
+  // correctness, so witness generation must fail — never a proof.
+  const r = await proof.generateProof(proofInputsForTest(validEnvelope(), 'REJECT'));
   assert.equal(r.ok, false);
-  assert.equal(r.configured, false);
   assert.equal(r.proof, undefined);
+});
+
+test('proof: buildCircuitInputs is deterministic (same task → same salt + taskId)', () => {
+  const a = proof.buildCircuitInputs(proofInputsForTest(validEnvelope(), 'APPROVE'));
+  const b = proof.buildCircuitInputs(proofInputsForTest(validEnvelope(), 'APPROVE'));
+  assert.equal(a.salt.toString(), b.salt.toString());
+  assert.equal(a.taskId.toString(), b.taskId.toString());
+  assert.equal(proof.deriveSalt('gk_901').toString(), a.salt.toString());
+});
+
+/** Stub fetch that records calls and plays a canned Kurier conversation. */
+function kurierStub({ jobStates = ['Submitted', 'Finalized'], submitStatus = 200 } = {}) {
+  const calls = [];
+  let statusIdx = 0;
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    if (url.includes('/submit-proof/')) {
+      return {
+        ok: submitStatus >= 200 && submitStatus < 300,
+        status: submitStatus,
+        json: async () => ({ jobId: 'job_test_1' }),
+      };
+    }
+    const state = jobStates[Math.min(statusIdx, jobStates.length - 1)];
+    statusIdx += 1;
+    return { ok: true, status: 200, json: async () => ({ status: state }) };
+  };
+  return { fetchImpl, calls };
+}
+
+test('proof: submitProof with a stubbed fetch reaches Finalized without network', async () => {
+  await withEnv({ KURIER_API_KEY: 'test-key-do-not-use' }, async () => {
+    const { fetchImpl, calls } = kurierStub();
+    const r = await proof.submitProof({ pi_a: ['1', '2'], pi_b: [['1', '2'], ['3', '4']], pi_c: ['5', '6'], protocol: 'groth16', curve: 'bn128' }, ['1', '2'], { fetchImpl, pollMs: 5, budgetMs: 5000 });
+    assert.equal(r.ok, true);
+    assert.equal(r.status, 'Finalized');
+    assert.equal(r.jobId, 'job_test_1');
+    // Submit call: key in the path (never a header), Playbook body shape.
+    const submit = calls.find((c) => c.url.includes('/submit-proof/'));
+    assert.ok(submit, 'submit call recorded');
+    assert.equal(submit.url, 'https://api.kurier.xyz/api/v1/submit-proof/test-key-do-not-use');
+    assert.equal(submit.init.headers.authorization, undefined);
+    const body = JSON.parse(submit.init.body);
+    assert.equal(body.proofType, 'groth16');
+    assert.equal(body.vkRegistered, true);
+    assert.deepEqual(body.proofOptions, { library: 'snarkjs', curve: 'bn128' });
+    assert.equal(body.proofData.vk, proof.GATEKEEPER_VK_HASH);
+    assert.deepEqual(body.proofData.publicSignals, ['1', '2']);
+    // Poll call: GET job-status with the same key + job id.
+    const poll = calls.find((c) => c.url.includes('/job-status/'));
+    assert.ok(poll, 'poll call recorded');
+    assert.equal(poll.url, 'https://api.kurier.xyz/api/v1/job-status/test-key-do-not-use/job_test_1');
+  });
+});
+
+test('proof: submitProof without a key never calls fetch', async () => {
+  await withEnv({ KURIER_API_KEY: undefined }, async () => {
+    let called = 0;
+    const fetchImpl = async () => {
+      called += 1;
+      throw new Error('must not be called');
+    };
+    const r = await proof.submitProof({}, ['1'], { fetchImpl });
+    assert.equal(r.ok, false);
+    assert.equal(called, 0);
+    assert.match(r.reason, /KURIER_API_KEY/);
+  });
+});
+
+test('proof: submitProof surfaces a non-OK submit response', async () => {
+  await withEnv({ KURIER_API_KEY: 'test-key-do-not-use' }, async () => {
+    const r = await proof.submitProof({}, ['1'], {
+      fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /401/);
+  });
+});
+
+test('proof: proveDecision end-to-end with stubbed fetch returns a finalized proof', async () => {
+  await withEnv({ KURIER_API_KEY: 'test-key-do-not-use' }, async () => {
+    const { fetchImpl } = kurierStub();
+    const r = await proof.proveDecision(proofInputsForTest(validEnvelope(), 'APPROVE'), {
+      fetchImpl,
+      pollMs: 5,
+      budgetMs: 10000,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.status, 'Finalized');
+    assert.equal(r.jobId, 'job_test_1');
+    assert.ok(r.proof && r.proof.pi_a);
+    assert.equal(r.publicSignals.length, 13);
+  });
 });
 
 // --- HTTP service ------------------------------------------------------------
@@ -254,8 +447,11 @@ async function waitForHealth(base, timeoutMs = 5000) {
 }
 
 test('http: server boots, /health answers (unsigned)', async (t) => {
+  // Proof env stripped on purpose: this test asserts the decision path
+  // returns no proof fields, which requires PROOF_ENABLED off / no key.
+  const { KURIER_API_KEY: _k, PROOF_ENABLED: _p, ...envNoProof } = process.env;
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-    env: { ...process.env, PORT: String(TEST_PORT), AGENT_GAMES_HMAC_SECRET: TEST_SECRET },
+    env: { ...envNoProof, PORT: String(TEST_PORT), AGENT_GAMES_HMAC_SECRET: TEST_SECRET },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   t.after(() => child.kill());
@@ -373,7 +569,7 @@ test('http: server boots, /health answers (unsigned)', async (t) => {
 });
 
 test('http: server without a secret refuses every POST (fail closed)', async (t) => {
-  const { AGENT_GAMES_HMAC_SECRET: _drop, ...envNoSecret } = process.env;
+  const { AGENT_GAMES_HMAC_SECRET: _drop, KURIER_API_KEY: _k, PROOF_ENABLED: _p, ...envNoSecret } = process.env;
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     env: { ...envNoSecret, PORT: String(NO_SECRET_PORT) },
     stdio: ['ignore', 'pipe', 'pipe'],

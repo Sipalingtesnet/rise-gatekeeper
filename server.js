@@ -23,7 +23,8 @@
  *   agent-games.proof-gatekeeper.v1 → task; response
  *       {"decision":"APPROVE"|"REJECT","reason_code":"...","proof_tx":"...?"}
  *       plus "proof" / "public_signals" only when a real proof exists
- *       (see proof.js — scaffolded, not live yet).
+ *       (see proof.js — real snarkjs + Kurier implementation; a proof
+ *       failure or timeout simply omits the fields).
  *   agent-games.preflight.v1 → preflight; response
  *       {"ok":true,"protocolVersion":"v1"} (signed).
  *   (no `type`) → treated as a task (flat test-only form, for local testing).
@@ -32,6 +33,10 @@
  * Decision rules live in decide.js. The 60s hard deadline from the
  * Playbook is enforced two ways: tasks past `deadline_at` are rejected in
  * decide.js, and the HTTP server closes requests still open after 60s.
+ * The proof attempt is capped at 45s (local proving is ~1s; Kurier
+ * submission + polling to Finalized needs the rest) so the decision is
+ * always returned well inside the 60s window even if the proof path is
+ * slow.
  *
  * Run with `node server.js` (PORT env var, default 3000). Secrets come
  * from the environment only — never hardcoded, never committed, never
@@ -45,7 +50,11 @@ const proof = require('./proof');
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
-const PROOF_TIMEOUT_MS = 10000; // never let proof generation eat the task window
+// Proof budget for the server path: local proving is ~1s, Kurier submit +
+// polling to Finalized takes the rest. 45s stays well inside the Playbook's
+// 60s hard deadline; the decision is always returned even if the proof
+// times out (its fields are simply omitted).
+const PROOF_TIMEOUT_MS = 45000;
 
 const TASK_TYPE = 'agent-games.proof-gatekeeper.v1';
 const PREFLIGHT_TYPE = 'agent-games.preflight.v1';
@@ -73,12 +82,17 @@ function proofInputsFor(envelope, decision) {
       ? envelope.input
       : envelope;
   return {
+    taskId: envelope.task_id ?? envelope.taskId ?? input.task_id ?? input.taskId,
     registeredVk: input.registered_vk ?? input.expectedVk ?? input.expected_vk,
     proofVk: input.proof_vk ?? input.proofVk ?? input.vk,
     recipient: input.recipient,
     conditionRecipient: input.condition_recipient ?? input.expectedRecipient,
     amount: input.amount,
     maxTransfer: input.max_transfer ?? input.maximum ?? input.threshold,
+    minimum: input.minimum,
+    publicBalance: input.public_balance ?? input.publicBalance,
+    expiryBlock: input.expiry_block ?? input.expiryBlock,
+    currentBlock: input.current_block ?? input.currentBlock,
     decision,
   };
 }
@@ -149,10 +163,10 @@ const server = http.createServer((req, res) => {
       const tx = proofTxOf(msg);
       if (tx !== undefined) out.proof_tx = tx;
 
-      // Proof (Playbook scaffold points 4–5): only attempted when the
-      // operator enabled it AND the artifacts/credentials are configured.
-      // A failure or timeout simply omits the proof fields — the decision
-      // itself is always returned. Never blocks past the proof timeout.
+      // Proof (Playbook points 4–5): only attempted when the operator
+      // enabled it AND the artifacts/credentials are configured. A failure
+      // or timeout simply omits the proof fields — the decision itself is
+      // always returned. Never blocks past the proof timeout.
       if (process.env.PROOF_ENABLED === '1') {
         try {
           const proved = await Promise.race([
