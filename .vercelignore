@@ -1,0 +1,7 @@
+# Vercel deploys ONLY the serverless functions in api/ (+ the shared
+# decide.js / hmac.js they require). The standalone server must NOT be
+# deployed: Vercel wraps a root server.js as a catch-all function that
+# shadows /api/*, so /api/health and /api/agent 404. Keep server.js for
+# local / fly.io use only.
+server.js
+test.js
